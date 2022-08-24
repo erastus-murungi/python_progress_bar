@@ -1,7 +1,6 @@
 import sys
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from itertools import cycle
 from math import ceil
 from random import randint
@@ -33,7 +32,7 @@ def get_green_bold_colored(text: str) -> str:
     return colored(f"{text}", "green", attrs=["bold"])
 
 
-class IndeterminateProgressItem(ABC):
+class ProgressItem(ABC):
     id: uuid.UUID
     is_finished: bool = False
     start_time: float = float("inf")
@@ -77,8 +76,8 @@ class IndeterminateProgressItem(ABC):
             )
 
 
-class DeterminateProgressItem(IndeterminateProgressItem):
-    finish_time: float
+class DeterminateProgressItem(ProgressItem):
+    finish_time: Optional[float] = None
 
     @abstractmethod
     def get_normalized_progress(self) -> float:
@@ -124,7 +123,8 @@ class MockDownload(DeterminateProgressItem):
         ) / self.expected_download_duration
         if normalized_progress >= 1.0:
             self.is_finished = True
-            self.finish_time = monotonic()
+            if self.finish_time is None:
+                self.finish_time = monotonic()
         return min(normalized_progress, 1.0)
 
     def is_completed(self):
@@ -142,7 +142,7 @@ class FileDownloadThreaded(DeterminateProgressItem):
         total_size: Optional[int] = None
         downloaded: int = 0.0
         is_finished: bool = False
-        finish_time: float = -float("inf")
+        finish_time: float = None
 
     url: str
     filename: str
@@ -164,7 +164,8 @@ class FileDownloadThreaded(DeterminateProgressItem):
         )
         if normalized_progress >= 1.0:
             self.is_finished = True
-            self.finish_time = monotonic()
+            if self.finish_time is None:
+                self.finish_time = monotonic()
         return min(normalized_progress, 1.0)
 
     def is_completed(self) -> bool:
@@ -205,60 +206,46 @@ class FileDownloadThreaded(DeterminateProgressItem):
         return f"{self.filename} <- {self.url}"
 
 
-@dataclass
-class HeaderPrintState:
-    n_filled: int
-    n_left: int
-    n_jobs_completed: int
-
-    def __iter__(self):
-        yield from (self.n_filled, self.n_left, self.n_jobs_completed)
-
-
 class ProgressBarManager:
-    progress_items: tuple[DeterminateProgressItem, ...]
-
-    def __init__(self, progress_items: Iterable[DeterminateProgressItem]):
-        self.start_time = None
-        self.progress_items = tuple(progress_items)
-        self.header_print_state = HeaderPrintState(
-            0, MAX_NUMBER_CHARACTERS_HEADER_PROGRESS_BAR, 0
+    def __init__(
+        self,
+        progress_items: Iterable[DeterminateProgressItem],
+        progress_bar_header_title: str = "Downloading",
+    ):
+        self.start_time: Optional[float] = None
+        self.progress_items: tuple[DeterminateProgressItem, ...] = tuple(progress_items)
+        self.header_print_state: tuple[int, int, int] = (
+            0,
+            MAX_NUMBER_CHARACTERS_HEADER_PROGRESS_BAR,
+            0,
         )
+        self.progress_bar_header_title = progress_bar_header_title
 
     @staticmethod
     def delete_ascii_terminal_line(text_io: TextIO = sys.stdout):
         text_io.write(ANSI_ERASE_CURRENT_LINE)
         text_io.write(ANSI_MOVE_CURSOR_UP_ONE_LINE)
 
-    def pretty_print_progress_bar_header(
-        self, text_io: TextIO, update_completed_count=True
-    ):
-        n_jobs_total = len(self.progress_items)
-        if update_completed_count:
-            n_jobs_completed = len(
-                tuple(filter(lambda p: p.is_completed(), self.progress_items))
-            )
+    def update_header_print_state(self):
+        n_jobs_completed = len(
+            tuple(filter(lambda p: p.is_completed(), self.progress_items))
+        )
+        n_filled = ceil(
+            n_jobs_completed
+            / len(self.progress_items)
+            * MAX_NUMBER_CHARACTERS_HEADER_PROGRESS_BAR
+        )
+        n_left = MAX_NUMBER_CHARACTERS_HEADER_PROGRESS_BAR - n_filled
+        self.header_print_state = (n_filled, n_left, n_jobs_completed)
 
-            n_filled = ceil(
-                n_jobs_completed
-                / n_jobs_total
-                * MAX_NUMBER_CHARACTERS_HEADER_PROGRESS_BAR
-            )
-            n_left = MAX_NUMBER_CHARACTERS_HEADER_PROGRESS_BAR - n_filled
-
-            text_io.write(
-                f'{INDENT}{get_green_bold_colored("Downloading")}  '
-                f'[{"=" * (n_filled - 1) + ">"}{" " * n_left}] [{n_jobs_completed} / {n_jobs_total} downloaded]... {format_timespan(monotonic() - self.start_time, detailed=False)}  \n'
-            )
-            self.header_print_state.n_left = n_left
-            self.header_print_state.n_filled = n_filled
-            self.header_print_state.n_jobs_completed = n_jobs_completed
-        else:
-            n_filled, n_left, n_jobs_completed = self.header_print_state
-            text_io.write(
-                f'{INDENT}{get_green_bold_colored("Downloading")}  '
-                f'[{"=" * (n_filled - 1) + ">"}{" " * n_left}] [{n_jobs_completed} / {n_jobs_total} downloaded]... {format_timespan(monotonic() - self.start_time, detailed=False)}  \n'
-            )
+    def pretty_print_progress_bar_header(self, text_io: TextIO):
+        n_filled, n_left, n_jobs_completed = self.header_print_state
+        text_io.write(
+            f"{INDENT}{get_green_bold_colored(self.progress_bar_header_title)}  "
+            f'[{"=" * (n_filled - 1) + ">"}{" " * n_left}] '
+            f"[{n_jobs_completed} / {len(self.progress_items)} downloaded]... "
+            f"{format_timespan(monotonic() - self.start_time, detailed=False)}\n"
+        )
 
     def initialize_all_progress_items(self):
         for progress_item in self.progress_items:
@@ -308,13 +295,12 @@ class ProgressBarManager:
         ) = self.get_incomplete_progress_items_state()
         while incomplete_progress_items:
             text_io.write(ANSI_HIDE_CURSOR)
+
             while (
                 monotonic() - incomplete_progress_items_update_time
                 < COMPLETED_JOBS_REFRESH_TIME
             ):
-                self.pretty_print_progress_bar_header(
-                    text_io, update_completed_count=False
-                )
+                self.pretty_print_progress_bar_header(text_io)
                 self.pretty_print_all_progress_items(incomplete_progress_items, text_io)
                 self.delete_ascii_terminal_line()
 
@@ -322,11 +308,12 @@ class ProgressBarManager:
                 incomplete_progress_items,
                 incomplete_progress_items_update_time,
             ) = self.get_incomplete_progress_items_state()
+            self.update_header_print_state()
 
         self.pretty_print_progress_bar_header(text_io)
         self.cleanup_all_progress_items()
         text_io.write(
-            f"Successfully finished in {format_timespan(monotonic() - self.start_time)}"
+            f"Finished successfully in {format_timespan(monotonic() - self.start_time)}"
         )
         sys.stdout.write(ANSI_SHOW_CURSOR)
 
