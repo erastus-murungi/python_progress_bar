@@ -106,7 +106,17 @@ class DeterminateProgressItem(ProgressItem):
             )
 
 
-class MockDownload(DeterminateProgressItem):
+class DownloadingMixIn(ABC):
+    @abstractmethod
+    def get_total_size(self):
+        pass
+
+    @abstractmethod
+    def get_current_downloaded_size(self):
+        pass
+
+
+class MockDownload(DeterminateProgressItem, DownloadingMixIn):
     def __init__(self, download_size: float, bandwidth: float):
         super().__init__()
         self.size = download_size
@@ -134,18 +144,14 @@ class MockDownload(DeterminateProgressItem):
             or (monotonic() - self.start_time) > self.expected_download_duration
         )
 
+    def get_total_size(self):
+        return self.size
+
+    def get_current_downloaded_size(self):
+        return min(self.size, (monotonic() - self.start_time) * self.bandwidth)
+
     def __repr__(self):
         return f"{self.__class__.__qualname__}(size={self.size}MB, bandwidth={self.bandwidth}MBps)"
-
-
-class DownloadingMixIn(ABC):
-    @abstractmethod
-    def get_total_size(self):
-        pass
-
-    @abstractmethod
-    def get_current_downloaded_size(self):
-        pass
 
 
 class FileDownloadThreaded(DeterminateProgressItem, DownloadingMixIn):
@@ -239,6 +245,7 @@ class ProgressBarManager:
             0,
         )
         self.progress_bar_header_title = progress_bar_header_title
+        self.incomplete_progress_items = self.progress_items
         self.downloading = downloading
         if downloading:
             self.download_speed = 0
@@ -246,9 +253,7 @@ class ProgressBarManager:
 
     @staticmethod
     def delete_ascii_terminal_line(text_io: TextIO = sys.stdout):
-        text_io.write(ANSI_ERASE_CURRENT_LINE)
-        text_io.write("\r")
-        text_io.write(ANSI_MOVE_CURSOR_UP_ONE_LINE)
+        text_io.write(ANSI_ERASE_CURRENT_LINE + "\r" + ANSI_MOVE_CURSOR_UP_ONE_LINE)
 
     def update_header_print_state(self):
         n_jobs_completed = len(
@@ -268,7 +273,6 @@ class ProgressBarManager:
             sum(
                 progress_item.get_current_downloaded_size()
                 for progress_item in self.progress_items
-                if progress_item.is_not_completed()
             ),
             monotonic(),
         )
@@ -305,12 +309,11 @@ class ProgressBarManager:
 
     def pretty_print_all_progress_items(
         self,
-        progress_items: tuple[DeterminateProgressItem, ...],
         text_io: TextIO = sys.stdout,
     ):
         progress_items = tuple(
             sorted(
-                progress_items,
+                self.incomplete_progress_items,
                 key=lambda p: p.get_normalized_progress(),
                 reverse=True,
             )
@@ -327,7 +330,7 @@ class ProgressBarManager:
         self,
     ) -> tuple[tuple[DeterminateProgressItem, ...], float]:
         return (
-            tuple(filter(lambda p: p.is_not_completed(), self.progress_items)),
+            tuple(filter(lambda p: p.is_not_completed(), self.incomplete_progress_items)),
             monotonic(),
         )
 
@@ -337,10 +340,10 @@ class ProgressBarManager:
         self.initialize_all_progress_items()
 
         (
-            incomplete_progress_items,
+            self.incomplete_progress_items,
             incomplete_progress_items_update_time,
         ) = self.get_incomplete_progress_items_state()
-        while incomplete_progress_items:
+        while self.incomplete_progress_items:
             text_io.write(ANSI_HIDE_CURSOR)
 
             while (
@@ -348,11 +351,11 @@ class ProgressBarManager:
                 < COMPLETED_JOBS_REFRESH_TIME
             ):
                 self.pretty_print_progress_bar_header(text_io)
-                self.pretty_print_all_progress_items(incomplete_progress_items, text_io)
+                self.pretty_print_all_progress_items(text_io)
                 self.delete_ascii_terminal_line()
 
             (
-                incomplete_progress_items,
+                self.incomplete_progress_items,
                 incomplete_progress_items_update_time,
             ) = self.get_incomplete_progress_items_state()
             self.update_header_print_state()
