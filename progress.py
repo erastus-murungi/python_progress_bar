@@ -1,3 +1,4 @@
+import resource
 import sys
 import uuid
 from abc import ABC, abstractmethod
@@ -10,10 +11,10 @@ from typing import Iterable, Optional, TextIO
 
 import click
 import requests
-from humanfriendly import format_timespan
+from humanfriendly import format_size, format_timespan
 from termcolor import colored
 
-ANSI_ERASE_CURRENT_LINE = "\x1b[2K"
+ANSI_ERASE_CURRENT_LINE = "\u001b[2K"
 ANSI_MOVE_CURSOR_UP_ONE_LINE = "\x1b[1A"
 ANSI_HIDE_CURSOR = "\x1b[?25l"
 ANSI_SHOW_CURSOR = "\x1b[?25h"
@@ -97,7 +98,7 @@ class DeterminateProgressItem(ProgressItem):
             # we define done_str because f-strings do not allow `\`
             done_str = "\u2714"
             text_io.write(
-                f"{INDENT}{get_green_bold_colored(done_str)} {progress_item_title}... Finished in {format_timespan(self.finish_time - self.start_time)}\n"
+                f"{INDENT}{get_green_bold_colored(done_str)} {progress_item_title} ... finished in {format_timespan(self.finish_time - self.start_time)}\n"
             )
         else:
             text_io.write(
@@ -137,7 +138,17 @@ class MockDownload(DeterminateProgressItem):
         return f"{self.__class__.__qualname__}(size={self.size}MB, bandwidth={self.bandwidth}MBps)"
 
 
-class FileDownloadThreaded(DeterminateProgressItem):
+class DownloadingMixIn(ABC):
+    @abstractmethod
+    def get_total_size(self):
+        pass
+
+    @abstractmethod
+    def get_current_downloaded_size(self):
+        pass
+
+
+class FileDownloadThreaded(DeterminateProgressItem, DownloadingMixIn):
     class DownloadState:
         total_size: Optional[int] = None
         downloaded: int = 0.0
@@ -147,6 +158,7 @@ class FileDownloadThreaded(DeterminateProgressItem):
     url: str
     filename: str
     download_thread: Thread
+    latest_size_and_timestamp = tuple[float, float]
 
     def __init__(self, url: str, filename: str = ""):
         super().__init__()
@@ -205,12 +217,19 @@ class FileDownloadThreaded(DeterminateProgressItem):
     def get_progress_item_title(self) -> str:
         return f"{self.filename} <- {self.url}"
 
+    def get_total_size(self):
+        return self.download_state.total_size
+
+    def get_current_downloaded_size(self):
+        return self.download_state.downloaded
+
 
 class ProgressBarManager:
     def __init__(
         self,
         progress_items: Iterable[DeterminateProgressItem],
         progress_bar_header_title: str = "Downloading",
+        downloading: bool = False,
     ):
         self.start_time: Optional[float] = None
         self.progress_items: tuple[DeterminateProgressItem, ...] = tuple(progress_items)
@@ -220,10 +239,15 @@ class ProgressBarManager:
             0,
         )
         self.progress_bar_header_title = progress_bar_header_title
+        self.downloading = downloading
+        if downloading:
+            self.download_speed = 0
+            self.prev_size_and_timestamp: tuple[float, float] = (0, 0)
 
     @staticmethod
     def delete_ascii_terminal_line(text_io: TextIO = sys.stdout):
         text_io.write(ANSI_ERASE_CURRENT_LINE)
+        text_io.write("\r")
         text_io.write(ANSI_MOVE_CURSOR_UP_ONE_LINE)
 
     def update_header_print_state(self):
@@ -238,14 +262,35 @@ class ProgressBarManager:
         n_left = MAX_NUMBER_CHARACTERS_HEADER_PROGRESS_BAR - n_filled
         self.header_print_state = (n_filled, n_left, n_jobs_completed)
 
+    def update_download_speed(self):
+        size, timestamp = self.prev_size_and_timestamp
+        current_size, current_timestamp = (
+            sum(
+                progress_item.get_current_downloaded_size()
+                for progress_item in self.progress_items
+                if progress_item.is_not_completed()
+            ),
+            monotonic(),
+        )
+        self.download_speed = (current_size - size) / (current_timestamp - timestamp)
+        self.prev_size_and_timestamp = (current_size, current_timestamp)
+
     def pretty_print_progress_bar_header(self, text_io: TextIO):
         n_filled, n_left, n_jobs_completed = self.header_print_state
-        text_io.write(
-            f"{INDENT}{get_green_bold_colored(self.progress_bar_header_title)}  "
-            f'[{"=" * (n_filled - 1) + ">"}{" " * n_left}] '
-            f"[{n_jobs_completed} / {len(self.progress_items)} downloaded]... "
-            f"{format_timespan(monotonic() - self.start_time, detailed=False)}\n"
-        )
+        if self.downloading:
+            text_io.write(
+                f"\r{INDENT}{get_green_bold_colored(self.progress_bar_header_title)}  "
+                f'[{"=" * (n_filled - 1) + ">"}{" " * n_left}] '
+                f"[{n_jobs_completed} / {len(self.progress_items)} downloaded] ... "
+                f"{format_timespan(monotonic() - self.start_time, detailed=False)}    ({format_size(self.download_speed)} / sec)\n"
+            )
+        else:
+            text_io.write(
+                f"\r{INDENT}{get_green_bold_colored(self.progress_bar_header_title)}  "
+                f'[{"=" * (n_filled - 1) + ">"}{" " * n_left}] '
+                f"[{n_jobs_completed} / {len(self.progress_items)} downloaded]... "
+                f"{format_timespan(monotonic() - self.start_time, detailed=False)}\n"
+            )
 
     def initialize_all_progress_items(self):
         for progress_item in self.progress_items:
@@ -275,6 +320,7 @@ class ProgressBarManager:
         sleep(FRAMES_PER_CYCLE)
         for _ in range(len(progress_items)):
             self.delete_ascii_terminal_line()
+        text_io.write("\r")
         text_io.write(ANSI_ERASE_CURRENT_LINE)
 
     def get_incomplete_progress_items_state(
@@ -287,6 +333,7 @@ class ProgressBarManager:
 
     def run(self, text_io: TextIO = sys.stdout):
         self.start_time = monotonic()
+        self.prev_size_and_timestamp = (0, self.start_time)
         self.initialize_all_progress_items()
 
         (
@@ -309,11 +356,15 @@ class ProgressBarManager:
                 incomplete_progress_items_update_time,
             ) = self.get_incomplete_progress_items_state()
             self.update_header_print_state()
-
-        self.pretty_print_progress_bar_header(text_io)
+            self.update_download_speed()
+        text_io.write(ANSI_ERASE_CURRENT_LINE)
+        text_io.write("\r")
         self.cleanup_all_progress_items()
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
         text_io.write(
-            f"Finished successfully in {format_timespan(monotonic() - self.start_time)}"
+            f"Finished successfully\n"
+            f"     Time ─────────────────────── {format_timespan(monotonic() - self.start_time)}\n"
+            f"     Peak RAM use ─────────────── {format_size(rusage.ru_maxrss)}\n"
         )
         sys.stdout.write(ANSI_SHOW_CURSOR)
 
@@ -353,7 +404,7 @@ def test(
             MockDownload(randint(1, max_mock_file_size), download_speed / num_items)
             for _ in range(num_items)
         ]
-    progress_bar_manager = ProgressBarManager(downloads)
+    progress_bar_manager = ProgressBarManager(downloads, downloading=True)
     progress_bar_manager.run()
 
 
