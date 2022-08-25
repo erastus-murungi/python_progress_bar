@@ -8,6 +8,7 @@ from random import randint
 from threading import Thread
 from time import monotonic, sleep
 from typing import Iterable, Optional, TextIO
+from more_itertools import quantify
 
 import click
 import requests
@@ -256,9 +257,7 @@ class ProgressBarManager:
         text_io.write(ANSI_ERASE_CURRENT_LINE + "\r" + ANSI_MOVE_CURSOR_UP_ONE_LINE)
 
     def update_header_print_state(self):
-        n_jobs_completed = len(
-            tuple(filter(lambda p: p.is_completed(), self.progress_items))
-        )
+        n_jobs_completed = quantify(self.progress_items, lambda p: p.is_completed())
         n_filled = ceil(
             n_jobs_completed
             / len(self.progress_items)
@@ -353,12 +352,12 @@ class ProgressBarManager:
                 self.pretty_print_progress_bar_header(text_io)
                 self.pretty_print_all_progress_items(text_io)
                 self.delete_ascii_terminal_line()
+                self.update_header_print_state()
 
             (
                 self.incomplete_progress_items,
                 incomplete_progress_items_update_time,
             ) = self.get_incomplete_progress_items_state()
-            self.update_header_print_state()
             self.update_download_speed()
         text_io.write(ANSI_ERASE_CURRENT_LINE)
         text_io.write("\r")
